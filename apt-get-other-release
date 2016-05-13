@@ -1,0 +1,282 @@
+#!/bin/sh
+#
+# apt-get-other-release 1.0 2014-04-17 Bela Lubkin
+#
+# Version 1.0 commented on
+# http://askubuntu.com/questions/54681/can-i-make-do-release-upgrade-only-download-packages-for-a-later-upgrade
+# and posted on ftp://www.lubkin.com/pub/user/filbo/apt-get-other-release
+
+usage()
+{
+   cat << EOF   # not quoted, so ` and $ processing occurs
+
+$(basename $0): maintain a local package cache from which a future
+release upgrade may be performed.
+
+Usage: [sudo] $(basename $0) [-flags] [[--] apt-get parameters]
+
+       -h                 Help (this message)
+       -n                 No action (dry run)
+       -v                 Verbose
+       -f from_release    Release upgrading from (this system: "$(lsb_release -cs)")
+       -t to_release      Release upgrading to (default: "trusty")
+       -U                 Prepare for upgrade
+       -B                 Back out (de-prepare for upgrade)
+       -R                 Remove upgrade cache (not reversible!)
+
+Without additional apt-get parameters, default behavior is to do a
+refresh of the upgrade cache:
+
+   1. apt-get update
+   2. apt-get -d dist-upgrade
+
+Command #1 refreshes the package lists from the release repository.
+Command #2 downloads into the upgrade cache (but does not install) any
+packages which would be used during an actual "dist-upgrade".
+
+Examples of using apt-get parameters:
+
+   3. sudo $(basename $0) -s install hamfax
+   4. sudo $(basename $0) install hamfax
+
+Command #3 shows which packages would be installed when requesting
+"hamfax".  Command #4 downloads (but does not install) those packages.
+
+Use '-U' when you are ready to run the regular Ubuntu / Debian / etc.
+release upgrade tool.  It copies the upgrade cache into the system
+package cache so that the upgrade will be able to launch quickly.  Note:
+the upgrade may still need to download some additional packages due to
+complex dependencies.  Only use '-U' immediately before running your
+distro-provided release upgrader.  WARNING: '-U' leaves the system in
+an inconsistent state, suitable only for upgrading!
+
+Use '-B' if you decide not to upgrade at that moment.  You should not do
+any other package maintenance operations on either the system or the
+upgrade cache while in the '-U' state!
+
+EOF
+   exit 1
+}
+
+verbose=false
+dry_run=false
+fm_rel=$(lsb_release -cs)
+fm_rel_provider="'lsb_release -cs'"
+
+# N.B. this script ought to work for any Debian variant; "trusty"
+# reflects the 2014-04 timeframe and Ubuntu system on which I am
+# developing it.  It's inconvenient for future and other-distro users
+# that they must use "-t"; XXX figure out how to programatically
+# determine "next / most forward upstream release" from the same
+# repository as currently in use by the installed OS.
+to_rel=trusty  # XXX algorithm to detect newest release in repository???
+
+prepare=false
+backout=false
+remove=false
+
+while getopts ":hnvf:t:UBR" opt; do
+   case $opt in
+         h) usage;;
+         n) dry_run=true;;
+         v) verbose=true;;
+         f) fm_rel=$OPTARG; fm_rel_provider=you;;
+         t) to_rel=$OPTARG;;
+         U) prepare=true;;
+         B) backout=true;;
+         R) remove=true;;
+        \?) OPTIND=$((OPTIND - 1)); break;;
+   esac
+done
+shift $((OPTIND - 1))
+apt_get_args="$@"
+
+if ! $dry_run; then
+   if [ ! -w /etc ]; then
+      echo
+      echo "This script needs to be run as 'root', e.g. using sudo(8)"
+      usage
+   fi
+   perform=
+else
+   perform="echo Would do:"
+fi
+
+# XXX this is a pretty weak test and will match syntactically wrong
+# choices like "deb-src"; but it'll do.
+if ! grep -qw $fm_rel $(find /etc/apt/sources.list /etc/apt/sources.list.d -type f); then
+   # XXX this is an even weaker "likely" detector, but really this is up
+   # to the user, if `lsb_release -cs` won't cough up the right answer;
+   # which it will.  For anything odd, roll your own sources.list files!
+   likely_rel=$(
+      awk '/^#/ || NF < 3 { next } { sub(/-.*/, "", $3); print $3 }' \
+          $(find /etc/apt/sources.list /etc/apt/sources.list.d -type f) |
+      sort |
+      uniq -c |
+      sort -rn |
+      awk 'NR == 1 { print $2 }'
+   )
+   if [ "$fm_rel" != "$likely_rel" ]; then
+      echo "According to $fm_rel_provider, you are running '$fm_rel', but the apt sources.list"
+      echo "files look like you might be running '$likely_rel'.  Please use '-f' to specify."
+      usage
+   fi
+fi
+
+sys_cache=/var/cache/apt/archives
+got_cache=/var/cache/apt-$to_rel/archives
+bak_cache=/var/cache/apt/archives-pre-$to_rel
+
+if $prepare || $backout; then
+   if $prepare && $backout; then
+      echo "Make up your mind!"
+      usage
+   fi
+   if $prepare; then
+      # This intentionally does not touch $got_cache or any of the other
+      # $to_rel directories created by the script.
+      if [ -d $bak_cache ]; then
+         echo "Backup directory $bak_cache exists; you are in a '-U' environment; use '-B' first."
+         exit 1
+      fi
+      if [ ! -d $got_cache ]; then
+         echo "Upgrade cache directory $got_cache does not exist; do you need to use '-t'?"
+         exit 1
+      fi
+      mv $sys_cache $bak_cache
+      mkdir $sys_cache
+      cd $got_cache
+      find . | cpio --quiet -dumpl $sys_cache
+      echo "Your downloads are in place, now run your release upgrader!"
+      echo
+      echo "NOTE: you should not do anything else while in this state!  Just run the"
+      echo "release upgrader, or run '$(basename $0) -B' to restore the state of your"
+      echo "running system.  (The upgrade cache will not be harmed.)"
+      exit 0
+   fi
+   if $backout; then
+      # This just restores what we saved, blowing away what we created in
+      # -U.  These flags aren't meant to be used a long time apart.
+      # However, consequences should be small, as the APT subsystem will
+      # maintain the cache as it sees fit.
+      if [ ! -d $bak_cache ]; then
+         echo "Uh-oh!  Backup directory $bak_cache does not exist."
+         exit 1
+      fi
+      rm -rf $sys_cache
+      mv $bak_cache $sys_cache
+      exit 0
+   fi
+   echo "Where am I?!?"
+   exit 1
+fi
+
+if $remove && [ -d $bak_cache ]; then
+   echo
+   echo "WARNING: removing upgrade cache while in ready-to-upgrade '-U' state."
+   echo "This is OK if you intend to immediately upgrade and the upgrade is"
+   echo "successful, but limits your options if it fails.  Type 'yes' if you"
+   echo -n "really mean to do this: "
+   read cowabunga
+   case $cowabunga in
+      yes|"'yes'") : ;;
+                *) echo "Whew.  Not doing anything."; echo; exit 0;;
+   esac
+   echo "Okay, then!  You can still restore your previous system cache by using"
+   echo "the '-B' flag.  Going ahead with removal."
+   echo
+fi
+
+for dir_info in \
+   "/var/lib/apt,/lists/,Dir::State" \
+   "/var/lib/dpkg/status,//,Dir::State::status" \
+   "/var/cache/apt,/archives/,Dir::Cache" \
+   "/etc/apt,//,Dir::Etc" \
+   "/var/log/apt,.,Dir::Log" \
+; do
+   source=${dir_info%%,*}
+   target=$source-$to_rel
+   config=${dir_info##*,}
+   ignore=${dir_info%,*}
+   ignore=${ignore#*,}
+
+   if $remove; then
+      if $verbose; then
+         echo "Remove: '$target'"
+      fi
+      rm -rf $target
+      continue
+   fi
+   if $verbose; then
+      echo "Source: '$source'"
+      echo "Target: '$target'"
+      echo "Config: '$config'"
+      echo "Ignore: '$ignore'"
+   fi
+   if [ -d $source ]; then
+      cd $source
+      if $verbose; then
+         if [ ! -d $target ]; then
+            echo "Create target directory '$target'."
+            count_1=$(find . -type f | wc -l)
+            count_2=$(find . -type f | grep -v "$ignore" | wc -l)
+            echo "Source dir has $count_1 files; $count_2 after filtering."
+            count_delta=$((count_1 - count_2))
+            if [ $count_delta -gt 0 ]; then
+               extra_msg=
+               [ $count_delta -gt 10 ] && extra_msg=" (first and last 5 of $count_1)"
+               echo "===== Omitted files$extra_msg: ====="
+               find $source -type f | grep "$ignore" | awk '
+                  NR <= 5
+                  { line[NR % 5] = $0 }
+                  END {
+                     if (NR > 10) print "..."
+                     for (num = (NR < 10 ? 5 : NR - 5) + 1; num <= NR; num++)
+                        print line[num % 5]
+                  }'
+               echo "=========================="
+            fi
+         else
+            echo "Target directory '$target' already exists, not copying."
+         fi
+         echo
+      fi # $verbose
+      if ! $dry_run && [ ! -d $target ]; then
+         rm -f $target
+         mkdir -p $target
+         find . | grep -v "$ignore" | cpio --quiet -dump $target
+         if [ $source = /etc/apt ]; then
+            cd $target
+            for name in $(find sources.list sources.list.d -type f -name "*$fm_rel*"); do
+               mv $name $(echo $name | sed s/$fm_rel/$to_rel/)
+            done
+            sed -i'' s/$fm_rel/$to_rel/g $(find sources.list sources.list.d -type f)
+         fi
+      fi
+   else # [ ! -d $source ]
+      if $verbose; then
+         if [ ! -e $target ]; then
+            echo "Create target file '$target'."
+         else
+            echo "Target file '$target' already exists, not copying."
+         fi
+         echo
+      fi
+      if ! $dry_run && [ ! -e $target ]; then
+         cp -p $source $target
+      fi
+   fi
+   APT_FLAGS="$APT_FLAGS -o $config=$target"
+done
+
+if $remove; then
+   echo "Upgrade cache for release '$to_rel' removed."
+   exit 0
+fi
+
+if [ "" != "$apt_get_args" ]; then
+   $perform apt-get $APT_FLAGS -d $apt_get_args
+else
+   $perform apt-get $APT_FLAGS update
+   $perform apt-get $APT_FLAGS -d dist-upgrade
+fi
